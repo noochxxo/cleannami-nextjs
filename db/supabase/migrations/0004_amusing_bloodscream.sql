@@ -1,0 +1,1 @@
+ALTER TABLE "subscriptions" ADD COLUMN "end_date" date NOT NULL;

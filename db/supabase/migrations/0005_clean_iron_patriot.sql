@@ -1,0 +1,1 @@
+ALTER TABLE "properties" RENAME COLUMN "hot_tub_service_level" TO "hot_tub_service";

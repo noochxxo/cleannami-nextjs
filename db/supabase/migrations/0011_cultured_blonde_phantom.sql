@@ -1,0 +1,1 @@
+ALTER TABLE "cleaners" ADD COLUMN "travel_radius_miles" integer DEFAULT 25;

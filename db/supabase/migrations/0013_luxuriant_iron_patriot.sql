@@ -1,0 +1,1 @@
+ALTER TABLE "onboarding_documents" ADD CONSTRAINT "onboarding_documents_cleaner_id_document_type_unique" UNIQUE("cleaner_id","document_type");
