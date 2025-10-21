@@ -2,7 +2,33 @@ import { createServerClient } from "@supabase/ssr";
 import { NextResponse, type NextRequest } from "next/server";
 import { hasEnvVars } from "../utils";
 
+const allowedOrigins = [
+  'capacitor://localhost',
+  'http://localhost',
+  'http://localhost:8080',
+];
+
 export async function updateSession(request: NextRequest) {
+  const origin = request.headers.get('origin');
+  const pathname = request.nextUrl.pathname;
+  if (
+    request.method === 'OPTIONS' &&
+    pathname.startsWith('/api') &&
+    origin &&
+    allowedOrigins.includes(origin)
+  ) {
+    return new NextResponse(null, {
+      status: 204, // No Content
+      headers: {
+        'Access-Control-Allow-Origin': origin,
+        'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-api-key', // Add any other headers your client sends
+        'Access-Control-Max-Age': '86400', // Cache preflight response for 24 hours
+      },
+    });
+  }
+
+
   let supabaseResponse = NextResponse.next({
     request,
   });
@@ -74,7 +100,8 @@ export async function updateSession(request: NextRequest) {
   //     request.nextUrl.pathname.startsWith(route + "/")
   // );
 
-  const pathname = request.nextUrl.pathname;
+  
+  
 
    const isProtectedCustomerRoute = 
     pathname.startsWith('/customer');
@@ -112,7 +139,14 @@ export async function updateSession(request: NextRequest) {
   }
 
   
-
+  if (
+    pathname.startsWith('/api') &&
+    origin &&
+    allowedOrigins.includes(origin)
+  ) {
+    supabaseResponse.headers.set('Access-Control-Allow-Origin', origin);
+    supabaseResponse.headers.set('Access-Control-Allow-Credentials', 'true');
+  }
   
 
   // IMPORTANT: You *must* return the supabaseResponse object as it is.

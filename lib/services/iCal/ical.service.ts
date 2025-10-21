@@ -4,9 +4,48 @@ import { and, eq } from "drizzle-orm";
 import { NodePgDatabase } from "drizzle-orm/node-postgres";
 import * as webcal from "node-ical";
 import { VEvent } from "node-ical";
+import { fromZonedTime } from 'date-fns-tz';
 
 type NewJob = typeof jobs.$inferInsert;
 type DrizzleDb = NodePgDatabase<typeof schema>;
+
+const IANA_TIMEZONE = "America/New_York";
+const DEFAULT_CHECKIN_TIME = "T16:00:00"; // 4:00 PM
+const DEFAULT_CHECKOUT_TIME = "T09:00:00"; // 9:00 AM
+const isDateOnly = (event: VEvent): boolean => {
+  // Use node-ical's datetype property to definitively detect date-only events
+  // 'date' = date-only (VALUE=DATE in iCal, use default times)
+  // 'date-time' = timed event (use actual times from calendar)
+  return event.datetype === 'date';
+};
+
+const createFloridaDate = (date: Date, timeStr: string): Date => {
+  // node-ical parses VALUE=DATE fields with system timezone offset
+  // We need to normalize to the actual calendar date first
+  // If the time has an offset (like 06:00:00Z from UTC-6 system), adjust it
+  const offsetHours = date.getUTCHours();
+
+  let normalizedDate = date;
+  if (offsetHours > 0 && offsetHours <= 14) {
+    // Subtract the offset to get back to the actual calendar date at midnight
+    normalizedDate = new Date(date.getTime() - (offsetHours * 60 * 60 * 1000));
+  }
+
+  const year = normalizedDate.getUTCFullYear();
+  const month = normalizedDate.getUTCMonth() + 1;
+  const day = normalizedDate.getUTCDate();
+
+  const dateOnlyStr = `${year}-${String(month).padStart(2, "0")}-${String(
+    day
+  ).padStart(2, "0")}`;
+
+  const localTimeStr = `${dateOnlyStr}${timeStr}`; // e.g., "2025-11-08T16:00:00"
+
+  // Convert from Florida time to UTC
+  const utcDate = fromZonedTime(localTimeStr, IANA_TIMEZONE);
+
+  return utcDate;
+};
 
 const BATCH_SIZE = 100;
 
@@ -209,11 +248,39 @@ export class ICalService {
       (a, b) => new Date(a.start).getTime() - new Date(b.start).getTime()
     );
 
-    const allJobsToInsert: NewJob[] = sortedEvents.map((event, index) => {
-      const jobStartTime = event.end;
-      const nextEvent = sortedEvents[index + 1];
-      const jobDeadline =
-        nextEvent?.start || new Date(new Date(event.end).setHours(16, 0, 0, 0)); // Default 4 PM same day
+    // Filter out events that start less than 7 days from today
+    const cutoffDate = new Date();
+    cutoffDate.setDate(cutoffDate.getDate() + 7);
+    cutoffDate.setHours(0, 0, 0, 0);
+
+    const filteredEvents = sortedEvents.filter((event) => {
+      const eventStartDate = new Date(event.start);
+      eventStartDate.setHours(0, 0, 0, 0);
+      return eventStartDate.getTime() >= cutoffDate.getTime();
+    });
+
+    const allJobsToInsert: NewJob[] = filteredEvents.map((event, index) => {
+      // Check if event is date-only (uses datetype property from node-ical)
+      const isEndDateOnly = isDateOnly(event);
+
+      // For date-only events, use default Florida times (9am checkout, 4pm checkin)
+      // For timed events, use the actual times from the calendar
+      const jobStartTime: Date = isEndDateOnly
+        ? createFloridaDate(event.end, DEFAULT_CHECKOUT_TIME) // 9:00 AM
+        : event.end;
+
+      const nextEvent = filteredEvents[index + 1];
+
+      // Process cleaning deadline (next guest checkin or 4 PM same day)
+      let jobDeadline: Date;
+      if (nextEvent) {
+        const isNextStartDateOnly = isDateOnly(nextEvent);
+        jobDeadline = isNextStartDateOnly
+          ? createFloridaDate(nextEvent.start, DEFAULT_CHECKIN_TIME)
+          : nextEvent.start;
+      } else {
+        jobDeadline = createFloridaDate(event.end, DEFAULT_CHECKIN_TIME);
+      }
 
       return {
         ...context,

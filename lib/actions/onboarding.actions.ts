@@ -195,6 +195,27 @@ export async function completeOnboarding(
         const icalService = new ICalService(db);
         await icalService.syncCalendar({ subscriptionId: result.subscription.id });
         console.log("Initial calendar sync completed successfully.");
+
+        // Mark the first job as paid (since it was paid during signup)
+        if (paymentIntentId) {
+          const firstJob = await db.query.jobs.findFirst({
+            where: eq(jobs.subscriptionId, result.subscription.id),
+            orderBy: (jobs, { asc }) => [asc(jobs.checkOutTime), asc(jobs.createdAt)],
+          });
+
+          if (firstJob) {
+            await db
+              .update(jobs)
+              .set({
+                paymentIntentId: paymentIntentId,
+                paymentStatus: 'captured',
+              })
+              .where(eq(jobs.id, firstJob.id));
+            console.log(`First job ${firstJob.id} marked as paid with payment intent ${paymentIntentId}`);
+          } else {
+            console.warn(`No jobs found for subscription ${result.subscription.id} after sync`);
+          }
+        }
       } catch (syncError) {
         console.error(
           `CRITICAL: Initial calendar sync failed for new subscription ${result.subscription.id}`,

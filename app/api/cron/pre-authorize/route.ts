@@ -21,7 +21,11 @@ export async function POST(req: NextRequest) {
 
   const dayAfterTomorrowStart = new Date(tomorrowStart);
   dayAfterTomorrowStart.setDate(tomorrowStart.getDate() + 1);
-  
+
+  console.log('=== PRE-AUTHORIZE CRON DEBUG ===');
+  console.log('Current time:', now.toISOString());
+  console.log('Tomorrow start:', tomorrowStart.toISOString());
+  console.log('Day after tomorrow:', dayAfterTomorrowStart.toISOString());
 
   try {
     const jobsToProcess = await db
@@ -29,6 +33,7 @@ export async function POST(req: NextRequest) {
         jobId: jobs.id,
         propertyData: properties,
         stripeCustomerId: customers.stripeCustomerId,
+        checkOutTime: jobs.checkOutTime,
       })
       .from(jobs)
       .innerJoin(subscriptions, eq(jobs.subscriptionId, subscriptions.id))
@@ -38,12 +43,26 @@ export async function POST(req: NextRequest) {
         and(
           gte(jobs.checkOutTime, tomorrowStart),
           lt(jobs.checkOutTime, dayAfterTomorrowStart),
-          isNull(jobs.paymentIntentId)
+          isNull(jobs.paymentIntentId),
+          isNull(jobs.paymentStatus)
         )
       );
 
+    console.log('Jobs to process:', jobsToProcess.length);
+    if (jobsToProcess.length > 0) {
+      console.log('Sample job checkout times:', jobsToProcess.slice(0, 3).map(j => ({
+        id: j.jobId,
+        checkOutTime: j.checkOutTime,
+      })));
+    }
+
     if (jobsToProcess.length === 0) {
-      return NextResponse.json({ message: "No jobs to process for tomorrow." });
+      return NextResponse.json({
+        message: "No jobs to process for tomorrow.",
+        debug: {
+          tomorrowRange: `${tomorrowStart.toISOString()} to ${dayAfterTomorrowStart.toISOString()}`
+        }
+      });
     }
 
     const processingPromises = jobsToProcess.map(async (job) => {
@@ -51,9 +70,29 @@ export async function POST(req: NextRequest) {
         if (!job.stripeCustomerId) {
           throw new Error(`Job ${job.jobId} is missing a Stripe Customer ID.`);
         }
-        
-        const priceDetails = await pricingService.calculatePrice(job.propertyData as any);
+
+        // Transform property data to match pricing service's expected format
+        const pricingInput = {
+          bedrooms: job.propertyData.bedCount,
+          bathrooms: Number(job.propertyData.bathCount),
+          sqft: job.propertyData.sqFt || 0,
+          laundryService: job.propertyData.laundryType,
+          laundryLoads: job.propertyData.laundryLoads,
+          hasHotTub: job.propertyData.hasHotTub,
+          hotTubService: job.propertyData.hotTubServiceLevel,
+          hotTubDrain: job.propertyData.hotTubDrain,
+          hotTubDrainCadence: job.propertyData.hotTubDrainCadence,
+        };
+
+        const priceDetails = await pricingService.calculatePrice(pricingInput as any);
         const amountInCents = Math.round(priceDetails.totalPerClean * 100);
+
+        console.log(`Job ${job.jobId}: Calculated price $${priceDetails.totalPerClean} (${amountInCents} cents)`);
+
+        // Stripe minimum charge is 50 cents for USD
+        if (amountInCents < 50) {
+          throw new Error(`Calculated amount ($${priceDetails.totalPerClean}) is below Stripe's minimum charge of $0.50. Check property pricing configuration.`);
+        }
 
         const paymentMethods = await stripe.paymentMethods.list({
             customer: job.stripeCustomerId,
@@ -72,6 +111,10 @@ export async function POST(req: NextRequest) {
           payment_method: paymentMethodId,
           capture_method: "manual",
           confirm: true,
+          automatic_payment_methods: {
+            enabled: true,
+            allow_redirects: "never",
+          },
         });
 
         await db
