@@ -6,14 +6,10 @@ import Stripe from "stripe";
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!);
 
-function appendNote(existing: string | null, newNote: string) {
-  return existing ? `${existing}\n${newNote}` : newNote;
-}
-
 export async function POST(req: NextRequest) {
   try {
     const apiKey = req.headers.get("x-api-key");
-
+    
     if (!apiKey || apiKey !== process.env.CLEANER_APP_API_KEY) {
       return NextResponse.json(
         { error: "Unauthorized: Invalid or missing API key" },
@@ -43,15 +39,6 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "Job not found" }, { status: 404 });
     }
 
-    // If payment already captured, no-op
-    if (job.paymentStatus === "captured") {
-      return NextResponse.json(
-        { message: "Payment already captured for this job" },
-        { status: 200 }
-      );
-    }
-
-    // Evidence validation (same as before)
     const evidence = await db.query.evidencePackets.findFirst({
       where: eq(evidencePackets.jobId, jobId),
     });
@@ -87,41 +74,41 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // ----------------------------
-    // Prepaid path: no paymentIntentId
-    // ----------------------------
+    // ====================================================================
+    // CASE 1: PREPAID JOB — No paymentIntentId
+    // ====================================================================
     if (!job.paymentIntentId) {
-      console.log(`Job ${jobId} is prepaid — skipping Stripe capture and creating payouts.`);
+      console.log(`💳 Job ${job.id} is prepaid — skipping Stripe capture`);
 
-      // Mark job as captured and add a note
       await db
         .update(jobs)
         .set({
           paymentStatus: "captured",
-          notes: appendNote(job.notes, "Prepaid at onboarding – no Stripe payment intent."),
+          paymentFailed: false,
+          notes: job.notes
+            ? `${job.notes}\n[System] Prepaid during onboarding – marked as captured.`
+            : "[System] Prepaid during onboarding – marked as captured.",
           updatedAt: new Date(),
         })
         .where(eq(jobs.id, jobId));
 
-      // Create payouts for assigned cleaners (same logic as original)
       const assignedCleaners = await db.query.jobsToCleaners.findMany({
         where: eq(jobsToCleaners.jobId, jobId),
-        with: {
-          cleaner: true,
-        },
+        with: { cleaner: true },
       });
 
       if (assignedCleaners.length === 0) {
         console.warn(`No cleaners assigned to prepaid job ${jobId}`);
         return NextResponse.json({
           success: true,
+          type: "prepaid",
           message: "Prepaid job marked captured but no cleaners assigned",
-          jobId,
+          jobId: jobId,
           payoutsCreated: 0,
         });
       }
 
-      const expectedHours = parseFloat(String(job.expectedHours || "0"));
+      const expectedHours = parseFloat(job.expectedHours || "0");
       const basePayPerCleaner = expectedHours * 17;
 
       const payoutPromises = assignedCleaners.map(async (assignment) => {
@@ -130,7 +117,7 @@ export async function POST(req: NextRequest) {
         let urgentBonus: number | null = null;
 
         if (assignment.role === "laundry_lead" && job.addonsSnapshot?.laundryLoads) {
-          laundryBonus = (job.addonsSnapshot.laundryLoads ?? 0) * 5;
+          laundryBonus = job.addonsSnapshot.laundryLoads * 5;
           totalPayout += laundryBonus;
         }
 
@@ -153,27 +140,35 @@ export async function POST(req: NextRequest) {
 
       return NextResponse.json({
         success: true,
+        type: "prepaid",
         message: "Prepaid job marked captured and payouts created",
-        jobId,
+        jobId: jobId,
         payoutsCreated: assignedCleaners.length,
       });
     }
 
-    // ----------------------------
-    // Stripe capture path (existing)
-    // ----------------------------
-    let paymentIntent: Stripe.PaymentIntent;
+    // ====================================================================
+    // CASE 2: NORMAL STRIPE PAYMENT INTENT FLOW
+    // ====================================================================
+    if (job.paymentStatus === "captured") {
+      return NextResponse.json(
+        { message: "Payment already captured for this job" },
+        { status: 200 }
+      );
+    }
 
+    let paymentIntent: Stripe.PaymentIntent;
+    
     try {
       paymentIntent = await stripe.paymentIntents.capture(job.paymentIntentId);
     } catch (stripeError: any) {
       console.error("Stripe capture failed:", stripeError);
-
+      
       await db
         .update(jobs)
         .set({
           paymentStatus: "capture_failed",
-          notes: appendNote(job.notes, `Capture failed: ${stripeError.message}`),
+          notes: `Capture failed: ${stripeError.message}`,
           updatedAt: new Date(),
         })
         .where(eq(jobs.id, jobId));
@@ -184,11 +179,10 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const capturedAmount = paymentIntent.amount_received ?? paymentIntent.amount ?? 0;
+    const capturedAmount = paymentIntent.amount;
     const reserveAmount = Math.round(capturedAmount * 0.02);
     const netAmount = capturedAmount - reserveAmount;
 
-    // Insert reserve transaction
     await db.insert(reserveTransactions).values({
       jobId: jobId,
       paymentIntentId: job.paymentIntentId,
@@ -197,7 +191,6 @@ export async function POST(req: NextRequest) {
       netAmountCents: netAmount,
     });
 
-    // Update job
     await db
       .update(jobs)
       .set({
@@ -206,12 +199,9 @@ export async function POST(req: NextRequest) {
       })
       .where(eq(jobs.id, jobId));
 
-    // Create payouts for assigned cleaners
     const assignedCleaners = await db.query.jobsToCleaners.findMany({
       where: eq(jobsToCleaners.jobId, jobId),
-      with: {
-        cleaner: true,
-      },
+      with: { cleaner: true },
     });
 
     if (assignedCleaners.length === 0) {
@@ -219,7 +209,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({
         success: true,
         message: "Payment captured but no cleaners assigned",
-        jobId,
+        jobId: jobId,
         capturedAmount,
         reserveAmount,
         netAmount,
@@ -228,8 +218,8 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    const expectedHoursVal = parseFloat(String(job.expectedHours || "0"));
-    const basePayPerCleaner = expectedHoursVal * 17;
+    const expectedHours = parseFloat(job.expectedHours || "0");
+    const basePayPerCleaner = expectedHours * 17;
 
     const payoutPromises = assignedCleaners.map(async (assignment) => {
       let totalPayout = basePayPerCleaner;
@@ -237,7 +227,7 @@ export async function POST(req: NextRequest) {
       let urgentBonus: number | null = null;
 
       if (assignment.role === "laundry_lead" && job.addonsSnapshot?.laundryLoads) {
-        laundryBonus = (job.addonsSnapshot.laundryLoads ?? 0) * 5;
+        laundryBonus = job.addonsSnapshot.laundryLoads * 5;
         totalPayout += laundryBonus;
       }
 
@@ -260,8 +250,9 @@ export async function POST(req: NextRequest) {
 
     return NextResponse.json({
       success: true,
+      type: "stripe",
       message: "Payment captured and payouts created",
-      jobId,
+      jobId: jobId,
       capturedAmount,
       reserveAmount,
       netAmount,
