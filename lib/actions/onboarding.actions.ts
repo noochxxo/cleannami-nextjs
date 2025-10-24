@@ -7,10 +7,12 @@ import {
   properties,
   subscriptions,
   checklistFiles,
+  jobs,
 } from "@/db/schema";
 import { SignupFormData, signupFormSchema } from "../validations/bookng-modal";
 import Stripe from 'stripe';
 import { ICalService } from "../services/iCal/ical.service";
+import { eq } from "drizzle-orm";
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!);
 const GOOGLE_MAPS_API_KEY = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY!;

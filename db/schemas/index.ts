@@ -22,3 +22,4 @@ export * from './badges.schema';
 export * from './cleanerBadges.schema';
 export * from './jobStats.schema';
 export * from './userPreferences.schema';
+export * from './pushNotificationTokens.schema';
