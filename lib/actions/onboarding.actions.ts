@@ -1,7 +1,7 @@
 "use server";
 
 import { db } from "@/db";
-import { createPublicFormClient } from "@/lib/supabase/server";
+import { createAdminClient } from "@/lib/supabase/server";
 import {
   customers,
   properties,
@@ -201,7 +201,7 @@ export async function completeOnboarding(
     const fileUploadResults: Array<{ fileName: string; success: boolean; error?: string }> = [];
     
     if (checklistFile && checklistFile.length > 0) {
-      const supabase = await createPublicFormClient();
+      const supabase = await createAdminClient();
       
       for (const file of checklistFile) {
         try {
