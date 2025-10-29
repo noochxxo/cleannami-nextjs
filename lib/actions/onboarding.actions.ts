@@ -43,12 +43,32 @@ async function geocodeAddress(address: string): Promise<{ latitude: string; long
   }
 }
 
+async function uploadFileWithRetry(
+  supabase: any, 
+  storagePath: string, 
+  file: File, 
+  maxRetries = 3
+): Promise<{ success: boolean; error?: any }> {
+  for (let i = 0; i < maxRetries; i++) {
+    const { error } = await supabase.storage
+      .from("checklists")
+      .upload(storagePath, file);
+    
+    if (!error) return { success: true };
+    
+    if (i === maxRetries - 1) return { success: false, error };
+    
+    await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1)));
+  }
+  
+  return { success: false, error: new Error('Max retries exceeded') };
+}
+
 export async function completeOnboarding(
   formData: SignupFormData,
   paymentIntentId: string
 ) {
   try {
-    
     const validatedData = signupFormSchema.parse(formData);
 
     const paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId);
@@ -79,11 +99,21 @@ export async function completeOnboarding(
       firstCleanDate,
     } = validatedData;
 
-    // ✅ Geocode the address
+    if (checklistFile && checklistFile.length > 0) {
+      for (const file of checklistFile) {
+        if (file.size > 10 * 1024 * 1024) { // 10MB limit
+          throw new Error(`File ${file.name} is too large. Maximum size is 10MB.`);
+        }
+        const allowedTypes = ['application/pdf', 'image/jpeg', 'image/png', 'image/jpg'];
+        if (!allowedTypes.includes(file.type)) {
+          throw new Error(`File ${file.name} has an unsupported format. Please use PDF, JPEG, or PNG files.`);
+        }
+      }
+    }
+
     const coordinates = await geocodeAddress(address);
 
     const result = await db.transaction(async (tx) => {
-      
       const [customer] = await tx
         .insert(customers)
         .values({ 
@@ -103,7 +133,6 @@ export async function completeOnboarding(
         })
         .returning();
 
-      // ✅ Build property values with geocoded data
       const propertyValues: any = {
         customerId: customer.id,
         address,
@@ -120,7 +149,6 @@ export async function completeOnboarding(
         iCalUrl,
       };
 
-      // ✅ Add geocoded coordinates if available
       if (coordinates) {
         propertyValues.latitude = coordinates.latitude;
         propertyValues.longitude = coordinates.longitude;
@@ -132,42 +160,19 @@ export async function completeOnboarding(
         .values(propertyValues)
         .returning()
         .catch((err) => {
-    console.error('DETAILED INSERT ERROR:', {
-      message: err.message,
-      code: err.code,
-      detail: err.detail,
-      hint: err.hint,
-      constraint: err.constraint,
-      table: err.table,
-      column: err.column,
-      dataType: err.dataType,
-      values: propertyValues
-    });
-    throw err;
-  });
-
-      if (checklistFile && checklistFile.length > 0) {
-        for (const file of checklistFile) {
-          const storagePath = `checklists/${property.id}/${file.name}`;
-          const supabase = await createPublicFormClient();
-          const { error: uploadError } = await supabase.storage
-            .from("checklists")
-            .upload(storagePath, file);
-
-          if (uploadError) {
-            throw new Error(
-              `Failed to upload checklist: ${uploadError.message}`
-            );
-          }
-
-          await tx.insert(checklistFiles).values({
-            propertyId: property.id,
-            fileName: file.name,
-            storagePath: storagePath,
-            fileSize: file.size,
+          console.error('DETAILED INSERT ERROR:', {
+            message: err.message,
+            code: err.code,
+            detail: err.detail,
+            hint: err.hint,
+            constraint: err.constraint,
+            table: err.table,
+            column: err.column,
+            dataType: err.dataType,
+            values: propertyValues
           });
-        }
-      }
+          throw err;
+        });
 
       const startDate = new Date(firstCleanDate);
       const endDate = new Date(startDate);
@@ -191,6 +196,59 @@ export async function completeOnboarding(
       return { customer, property, subscription };
     });
 
+    console.log("Database transaction completed successfully:", result);
+
+    const fileUploadResults: Array<{ fileName: string; success: boolean; error?: string }> = [];
+    
+    if (checklistFile && checklistFile.length > 0) {
+      const supabase = await createPublicFormClient();
+      
+      for (const file of checklistFile) {
+        try {
+          const storagePath = `checklists/${result.property.id}/${file.name}`;
+          
+          console.log(`Uploading file: ${file.name} to ${storagePath}`);
+          
+          const uploadResult = await uploadFileWithRetry(supabase, storagePath, file);
+          
+          if (uploadResult.success) {
+            await db.insert(checklistFiles).values({
+              propertyId: result.property.id,
+              fileName: file.name,
+              storagePath: storagePath,
+              fileSize: file.size,
+            });
+            
+            fileUploadResults.push({ fileName: file.name, success: true });
+            console.log(`Successfully uploaded and recorded: ${file.name}`);
+          } else {
+            fileUploadResults.push({ 
+              fileName: file.name, 
+              success: false, 
+              error: uploadResult.error?.message || 'Unknown upload error'
+            });
+            console.error(`Failed to upload ${file.name}:`, uploadResult.error);
+          }
+        } catch (fileError) {
+          fileUploadResults.push({ 
+            fileName: file.name, 
+            success: false, 
+            error: fileError instanceof Error ? fileError.message : 'Unknown error'
+          });
+          console.error(`Error processing file ${file.name}:`, fileError);
+        }
+      }
+      
+      const successfulUploads = fileUploadResults.filter(r => r.success).length;
+      const failedUploads = fileUploadResults.filter(r => !r.success);
+      
+      console.log(`File upload summary: ${successfulUploads}/${fileUploadResults.length} successful`);
+      
+      if (failedUploads.length > 0) {
+        console.warn('Failed file uploads:', failedUploads);
+      }
+    }
+
     if (result.subscription && iCalUrl) {
       console.log(`Onboarding successful. Triggering initial calendar sync for subscription: ${result.subscription.id}`);
       try {
@@ -198,7 +256,6 @@ export async function completeOnboarding(
         await icalService.syncCalendar({ subscriptionId: result.subscription.id });
         console.log("Initial calendar sync completed successfully.");
 
-        // Mark the first job as paid (since it was paid during signup)
         if (paymentIntentId) {
           const firstJob = await db.query.jobs.findFirst({
             where: eq(jobs.subscriptionId, result.subscription.id),
@@ -223,22 +280,39 @@ export async function completeOnboarding(
           `CRITICAL: Initial calendar sync failed for new subscription ${result.subscription.id}`,
           syncError
         );
+      
       }
     }
 
-    console.log("Successfully saved to database:", result);
-    return { success: true, data: result };
+    console.log("Successfully completed onboarding:", {
+      subscriptionId: result.subscription.id,
+      customerId: result.customer.id,
+      propertyId: result.property.id,
+      fileUploadResults
+    });
+
+    return { 
+      success: true, 
+      data: {
+        ...result,
+        fileUploadResults
+      }
+    };
+
   } catch (error) {
     console.error("CRITICAL: Onboarding failed after successful payment.", {
       paymentIntentId,
       error: error instanceof Error ? error.message : String(error),
       stack: error instanceof Error ? error.stack : undefined,
-      formData,
+      formData: {
+        ...formData,
+        checklistFile: formData.checklistFile ? `${formData.checklistFile.length} files` : 'none'
+      }
     });
 
     return {
       success: false,
-      error: "Failed to save subscription details. Please contact support.",
+      error: error instanceof Error ? error.message : "Failed to save subscription details. Please contact support.",
     };
   }
 }
