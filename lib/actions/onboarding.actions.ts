@@ -104,7 +104,7 @@ export async function completeOnboarding(
         if (file.size > 10 * 1024 * 1024) { // 10MB limit
           throw new Error(`File ${file.name} is too large. Maximum size is 10MB.`);
         }
-        const allowedTypes = ['application/pdf', 'image/jpeg', 'image/png', 'image/jpg'];
+        const allowedTypes = ['application/pdf', 'image/jpeg', 'image/png', 'image/jpg', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'text/csv', 'application/vnd.ms-excel', 'application/vnd.oasis.opendocument.spreadsheet'];
         if (!allowedTypes.includes(file.type)) {
           throw new Error(`File ${file.name} has an unsupported format. Please use PDF, JPEG, or PNG files.`);
         }
