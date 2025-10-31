@@ -113,6 +113,13 @@
       "when": 1761184110795,
       "tag": "0015_little_frank_castle",
       "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "7",
+      "when": 1761943737039,
+      "tag": "0016_opposite_manta",
+      "breakpoints": true
     }
   ]
 }

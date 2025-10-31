@@ -4,14 +4,40 @@ import { jobs, properties, subscriptions, customers } from "@/db/schemas";
 import { eq, and, isNull, gte, lt } from "drizzle-orm"; // Import gte and lt
 import { PricingService } from "@/lib/services/pricing.service";
 import Stripe from "stripe";
+import { CancellationDetectionService } from "@/lib/services/cancellation-detection/cancellationDetection.service";
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!);
 const pricingService = new PricingService();
 
 export async function POST(req: NextRequest) {
-  const authToken = (req.headers.get("authorization") || "").split("Bearer ")[1];
+  const authToken = (req.headers.get("authorization") || "").split(
+    "Bearer "
+  )[1];
   if (authToken !== process.env.CRON_SECRET) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  console.log("=== CANCELLATION DETECTION ===");
+  const cancellationService = new CancellationDetectionService(db);
+
+  try {
+    const cancellationResult =
+      await cancellationService.detectCancellationsForAllSubscriptions();
+
+    if (cancellationResult.success) {
+      console.log(
+        `✓ Cancellation detection completed: ${cancellationResult.totalJobsCancelled} jobs cancelled across ${cancellationResult.totalSubscriptions} subscriptions`
+      );
+    } else {
+      console.error(
+        `✗ Cancellation detection failed: ${cancellationResult.message}`
+      );
+    }
+  } catch (cancellationError) {
+    console.error(
+      "Cancellation detection error (continuing with sync):",
+      cancellationError
+    );
   }
 
   const now = new Date();
@@ -22,10 +48,10 @@ export async function POST(req: NextRequest) {
   const dayAfterTomorrowStart = new Date(tomorrowStart);
   dayAfterTomorrowStart.setDate(tomorrowStart.getDate() + 1);
 
-  console.log('=== PRE-AUTHORIZE CRON DEBUG ===');
-  console.log('Current time:', now.toISOString());
-  console.log('Tomorrow start:', tomorrowStart.toISOString());
-  console.log('Day after tomorrow:', dayAfterTomorrowStart.toISOString());
+  console.log("=== PRE-AUTHORIZE CRON DEBUG ===");
+  console.log("Current time:", now.toISOString());
+  console.log("Tomorrow start:", tomorrowStart.toISOString());
+  console.log("Day after tomorrow:", dayAfterTomorrowStart.toISOString());
 
   try {
     const jobsToProcess = await db
@@ -48,20 +74,23 @@ export async function POST(req: NextRequest) {
         )
       );
 
-    console.log('Jobs to process:', jobsToProcess.length);
+    console.log("Jobs to process:", jobsToProcess.length);
     if (jobsToProcess.length > 0) {
-      console.log('Sample job checkout times:', jobsToProcess.slice(0, 3).map(j => ({
-        id: j.jobId,
-        checkOutTime: j.checkOutTime,
-      })));
+      console.log(
+        "Sample job checkout times:",
+        jobsToProcess.slice(0, 3).map((j) => ({
+          id: j.jobId,
+          checkOutTime: j.checkOutTime,
+        }))
+      );
     }
 
     if (jobsToProcess.length === 0) {
       return NextResponse.json({
         message: "No jobs to process for tomorrow.",
         debug: {
-          tomorrowRange: `${tomorrowStart.toISOString()} to ${dayAfterTomorrowStart.toISOString()}`
-        }
+          tomorrowRange: `${tomorrowStart.toISOString()} to ${dayAfterTomorrowStart.toISOString()}`,
+        },
       });
     }
 
@@ -84,26 +113,34 @@ export async function POST(req: NextRequest) {
           hotTubDrainCadence: job.propertyData.hotTubDrainCadence,
         };
 
-        const priceDetails = await pricingService.calculatePrice(pricingInput as any);
+        const priceDetails = await pricingService.calculatePrice(
+          pricingInput as any
+        );
         const amountInCents = Math.round(priceDetails.totalPerClean * 100);
 
-        console.log(`Job ${job.jobId}: Calculated price $${priceDetails.totalPerClean} (${amountInCents} cents)`);
+        console.log(
+          `Job ${job.jobId}: Calculated price $${priceDetails.totalPerClean} (${amountInCents} cents)`
+        );
 
         // Stripe minimum charge is 50 cents for USD
         if (amountInCents < 50) {
-          throw new Error(`Calculated amount ($${priceDetails.totalPerClean}) is below Stripe's minimum charge of $0.50. Check property pricing configuration.`);
+          throw new Error(
+            `Calculated amount ($${priceDetails.totalPerClean}) is below Stripe's minimum charge of $0.50. Check property pricing configuration.`
+          );
         }
 
         const paymentMethods = await stripe.paymentMethods.list({
-            customer: job.stripeCustomerId,
-            type: 'card',
+          customer: job.stripeCustomerId,
+          type: "card",
         });
-        
+
         if (paymentMethods.data.length === 0) {
-            throw new Error(`No saved payment method found for customer ${job.stripeCustomerId}`);
+          throw new Error(
+            `No saved payment method found for customer ${job.stripeCustomerId}`
+          );
         }
         const paymentMethodId = paymentMethods.data[0].id;
-        
+
         const paymentIntent = await stripe.paymentIntents.create({
           amount: amountInCents,
           currency: "usd",
@@ -119,35 +156,33 @@ export async function POST(req: NextRequest) {
 
         await db
           .update(jobs)
-          .set({ 
-              paymentIntentId: paymentIntent.id, 
-              paymentStatus: 'authorized' 
-            })
+          .set({
+            paymentIntentId: paymentIntent.id,
+            paymentStatus: "authorized",
+          })
           .where(eq(jobs.id, job.jobId));
 
         return { jobId: job.jobId, status: "success" };
-
       } catch (error: any) {
         console.error(`Failed to process job ${job.jobId}:`, error.message);
         await db
           .update(jobs)
-          .set({ 
-              paymentStatus: 'failed', 
-              notes: error.message 
-            })
+          .set({
+            paymentStatus: "failed",
+            notes: error.message,
+          })
           .where(eq(jobs.id, job.jobId));
         return { jobId: job.jobId, status: "failed", error: error.message };
       }
     });
 
     const results = await Promise.all(processingPromises);
-    
+
     return NextResponse.json({
       message: "Pre-authorization process completed.",
       processedCount: results.length,
       results,
     });
-
   } catch (error: any) {
     console.error("Cron job failed:", error);
     return NextResponse.json(
